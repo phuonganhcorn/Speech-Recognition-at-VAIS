@@ -1,0 +1,169 @@
+import torchaudio
+from speechbrain.pretrained import EncoderClassifier, SpeakerRecognition
+from scipy.optimize import brentq
+from scipy.interpolate import interp1d
+from sklearn.metrics import roc_curve
+import numpy as np
+from numpy.linalg import norm
+from tqdm import tqdm
+import numpy as np
+import torch.onnx
+import torchaudio
+from torch import  nn
+from lobes.models.ECAPA_TDNN_192 import ECAPA_TDNN
+from speechbrain.lobes.features import Fbank
+from speechbrain.processing.features import InputNormalization
+
+class COMPUTE_EMB(nn.Module):
+    def __init__(self, model_path):
+        super(COMPUTE_EMB, self).__init__()
+        self.model_path = model_path
+        self.model = ECAPA_TDNN(input_size=80,
+                                channels=[1024, 1024, 1024, 1024, 3072],
+                                kernel_sizes=[5, 3, 3, 3, 1],
+                                dilations=[1, 2, 3, 4, 1],
+                                attention_channels=128,
+                                lin_neurons=192)
+        self.model.load_state_dict(torch.load(self.model_path, map_location=torch.device('cpu')))
+        self.model.eval()
+        self.model = self.model.cuda()
+        self.feature_maker = Fbank(n_mels=80)
+        self.norm = InputNormalization(norm_type='sentence', std_norm=False)
+    def forward(self, signal):
+        signal = signal.cuda()
+        sig_lens = torch.ones(signal.shape[0])
+        feats = self.feature_maker(signal)
+        feats = self.norm(feats, sig_lens)
+        embeddings = self.model(feats)
+        return embeddings
+
+
+audio_data_path = '/project/AI-team/exp/experiments/phuonganh/data_audio/modified-public-test.csv' # zalo challenge audio data
+
+'''
+    In calEmbeddings def
+    
+        1. Cal embeddings of each audio in arr unique_audio
+        2. Put into an embedds[] arr
+        3. Zip embedds[] and unique_audio[] 
+        4. Visualize:
+        
+            [unique_audio[audio1, audio2, audio3,..., ...]
+            embedds     [em_au1, em_au2, em_au3,..., ...]] 
+            
+        => compare index of ele in unique_audio to get embedd of that audio           
+'''
+
+def calEmbeddings(audio_data_path):
+    
+    # Initialize arr 
+    element1 = []
+    element2 = []
+    label_list = []
+    val_embedds = []
+    
+    # load pre-trained model
+    # verification = SpeakerRecognition.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="test_huggingface/vivos")
+    
+    # read audio data file
+    with open (audio_data_path, 'r') as f:
+        
+        lines = f.read().splitlines()
+        
+        for line in lines:
+            audio1, audio2, label = line.split(",")
+            element1.append(audio1) # list of audio1
+            element2.append(audio2) # list of audio2
+            label_list.append(int(label))
+            
+            
+        # convert list audio into array
+        au_arr1 = np.array(element1)
+        au_arr2 = np.array(element2)
+        # combine 2 list into 1 total list
+        total_list = element1 + element2
+        total_arr = np.array(total_list)
+        # print(total_arr)
+            
+        # get unique audio 
+        unique_audio = np.unique(total_arr) # arr of unique audio
+        
+        # cal embedds for each audio in unique_audio_arr
+        for i in tqdm(range(len(unique_audio))):
+            signal, fs = torchaudio.load(unique_audio[i])
+            embeddings = compute_emb(signal).squeeze().detach().cpu().numpy()
+            
+            # put embedds into arr
+            val_embedds.append(embeddings)
+            
+            # signal2, fs2 = torchaudio.load(element2[i])
+            # embeddings2 = classifier.encode_batch(signal2).squeeze().detach().cpu().numpy()
+            # data2.append(embeddings2)
+            
+            
+        # zip arr embedds and arr unique_audio
+        # au_em = (("au1", "em1"), ("au2", "em2"), ...)
+        au_em = zip(au_arr1, au_arr2)
+        
+
+    return au_arr1, au_arr2, label_list, au_em, val_embedds, unique_audio
+
+
+'''     
+    In calCosineDiff def
+        1. Iterater each element in arr1: contains audio1
+        2. Iterater each element in arr2: contains audio2
+        3. If unique[id] = arr[id] => get embedds[id]
+        4. Cal cosine diff of 2 embedds 
+'''
+def cosineDiff(au_arr1, au_arr2, au_em, val_embedds, unique_audio, label_list):
+    # Initialize embedd_score arr
+    embedds_score = []
+
+    # Get index of audio in unique_audio arr
+    for id, (name_au1, name_au2) in enumerate(au_em):
+        id1 = np.where(unique_audio == name_au1)[0][0]
+        id2 = np.where(unique_audio == name_au2)[0][0]
+        
+        # get embedds of audio id1, id2
+        val1 = val_embedds[id1]
+        val2 = val_embedds[id2]
+        
+        
+        # cal 2 embedds value
+        diff = np.dot(val1, val2)/((norm(val1)*norm(val2)))
+        embedds_score.append(diff)
+    return embedds_score
+
+
+
+# y_score = embedding
+# y_true = label
+
+def tuningEER(y_true, y_score):
+    fpr, tpr, thresholds = roc_curve(y_true, y_score, pos_label=1)
+
+    eer = brentq(lambda x : 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+    thresh = interp1d(fpr, thresholds)(eer)
+    print("EER:", eer)
+    print("Thresh:", thresh)
+    
+            
+
+if __name__ == "__main__":
+    global compute_emb
+    model_path = "/project/AI-team/exp/experiments/phuonganh/output/train/2001/save/CKPT+2023-09-26+15-06-39+00/embedding_model.ckpt"
+    compute_emb = COMPUTE_EMB(model_path)
+    au_arr1, au_arr2, label_list, au_em, val_embedds, unique_audio = calEmbeddings(audio_data_path)
+    embedds_score = cosineDiff(au_arr1, au_arr2, au_em, val_embedds, unique_audio, label_list)
+    tuningEER(y_true = label_list ,y_score = embedds_score)
+    print(model_path)
+    '''
+    output = []
+    output.append(','.join([model_path, eer, thresh]))
+
+    with open("test_save.txt", "w") as file:
+        file.writelines(",".join(output))
+    '''
+
+
